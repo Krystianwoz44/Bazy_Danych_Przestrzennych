@@ -1,0 +1,131 @@
+#!/bin/bash
+
+# Changelog:
+# 2025-01-27: Krystian Woźniak.
+
+# 1a: pobieranie pliku zip
+ZIP_URL="https://home.agh.edu.pl/~wsarlej/Customers_Nov2024.zip"  
+ZIP_FILE="Customers_Nov2024.zip"
+
+log "Downloading ZIP file from the internet."
+wget -O "$ZIP_FILE" "$ZIP_URL"
+
+if [ $? -ne 0 ]; then
+    log "Failed to download ZIP file."
+    exit 1
+fi
+
+# 1b: Rozpakowanie pliku
+
+log "Unzipping the downloaded file."
+unzip "$ZIP_FILE"
+
+if [ $? -ne 0 ]; then
+    log "Failed to unzip the file."
+    exit 1
+fi
+
+log "ZIP file downloaded and extracted successfully."
+
+# Parametry
+NUMER_INDEKSU="304361"  
+TIMESTAMP=$(date +"%m%d%Y")
+LOG_FILE="PROCESSED/script_${TIMESTAMP}.log"
+INPUT_FILE="Customers_Nov2024.csv"
+OLD_FILE="Customers_old.csv"
+DB_HOST="localhost"
+DB_USER="user"
+DB_PASSWORD="password"
+DB_NAME="database"
+OUTPUT_DIR="PROCESSED"
+REPORT_FILE="CUSTOMERS_LOAD_${TIMESTAMP}.dat"
+
+# przygotownie bibliotek
+mkdir -p "$OUTPUT_DIR"
+
+log() {
+    echo "$(date +"%Y%m%d%H%M%S") - $1" | tee -a "$LOG_FILE"
+}
+
+log "Starting script."
+
+# 1c: Walidacja pliku
+
+log "Validating input file."
+VALID_FILE="${OUTPUT_DIR}/Customers_Nov2024_valid.csv"
+BAD_FILE="${OUTPUT_DIR}/Customers_Nov2024.bad_${TIMESTAMP}"
+HEADER=$(head -n 1 "$INPUT_FILE")
+
+awk -v OFS="," -v HEADER="$HEADER" 'BEGIN {print HEADER > "'$VALID_FILE'"} \
+    NR>1 { \
+        if (NF != split(HEADER, a, ",")) {
+            print $0 >> "'$BAD_FILE'"; 
+        } else if (!match($0, /^[^,]+,[^,]+@[^,]+\.[^,]+/)) {
+            print $0 >> "'$BAD_FILE'"; 
+        } else {
+            print $0 >> "'$VALID_FILE'";
+        }
+    }' "$INPUT_FILE"
+
+log "Validation completed."
+
+#  Usuwanie duplikatów i porównanie z Old data
+log "Removing duplicates and comparing with old data."
+DEDUPED_FILE="${OUTPUT_DIR}/Customers_Nov2024_deduped.csv"
+sort "$VALID_FILE" | uniq | grep -vxF -f "$OLD_FILE" > "$DEDUPED_FILE"
+
+log "Deduplication completed."
+
+# 1d Tworzenie tabeli w bazie
+log "Creating database table."
+TABLE_NAME="CUSTOMERS_${NUMER_INDEKSU}"
+psql -h "$DB_HOST" -U "$DB_USER" -d "$DB_NAME" -c "CREATE TABLE IF NOT EXISTS $TABLE_NAME (id SERIAL PRIMARY KEY, data TEXT);"
+log "Table created."
+
+# 1e Dodanie danych
+log "Loading data into the database."
+psql -h "$DB_HOST" -U "$DB_USER" -d "$DB_NAME" -c "\copy $TABLE_NAME(data) FROM '$DEDUPED_FILE' CSV HEADER;"
+log "Data loaded."
+
+# 1f: Przenoszenie pliku
+log "Moving processed file."
+PROCESSED_FILE="${OUTPUT_DIR}/${TIMESTAMP}_Customers_Nov2024.csv"
+mv "$INPUT_FILE" "$PROCESSED_FILE"
+log "File moved."
+
+# 1g: Generowanie raportu
+log "Generating report."
+ROWS_DOWNLOADED=$(wc -l < "$INPUT_FILE")
+ROWS_VALID=$(wc -l < "$VALID_FILE")
+DUPLICATES=$(($(wc -l < "$INPUT_FILE") - $(wc -l < "$DEDUPED_FILE")))
+ROWS_LOADED=$(psql -h "$DB_HOST" -U "$DB_USER" -d "$DB_NAME" -c "SELECT COUNT(*) FROM $TABLE_NAME;" -t -A)
+
+cat > "$REPORT_FILE" <<EOL
+Liczba wierszy w pliku pobranym z internetu: $ROWS_DOWNLOADED
+Liczba poprawnych wierszy (po czyszczeniu): $ROWS_VALID
+Liczba duplikatów w pliku wejściowym: $DUPLICATES
+Ilość danych załadowanych do tabeli $TABLE_NAME: $ROWS_LOADED
+EOL
+
+log "Report generated."
+
+# 1h: Kwerenda
+log "Querying database for customers within 50km."
+BEST_TABLE="BEST_CUSTOMERS_${NUMER_INDEKSU}"
+psql -h "$DB_HOST" -U "$DB_USER" -d "$DB_NAME" -c "CREATE TABLE IF NOT EXISTS $BEST_TABLE AS \
+SELECT * FROM $TABLE_NAME WHERE ST_DistanceSpheroid(ST_MakePoint(longitude, latitude), ST_MakePoint(-75.67329768604034, 41.39988501005976), 'SPHEROID["WGS 84",6378137,298.257223563]') <= 50000;"
+
+# 1i: Exportowanie do csv
+log "Exporting best customers to CSV."
+EXPORT_FILE="${BEST_TABLE}.csv"
+psql -h "$DB_HOST" -U "$DB_USER" -d "$DB_NAME" -c "\copy $BEST_TABLE TO '$EXPORT_FILE' CSV HEADER;"
+
+# 1j kompresja pliku
+log "Compressing CSV."
+zip "${EXPORT_FILE}.zip" "$EXPORT_FILE"
+
+# 1k: Send email with compressed file and report
+log "Preparing to send email"
+echo "Script executed successfully." | mailx -a "${EXPORT_FILE}.zip" -a "$REPORT_FILE" -s "Customer Report" email@przyklad.com
+
+log "Script completed."
